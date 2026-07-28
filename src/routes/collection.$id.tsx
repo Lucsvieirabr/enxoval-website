@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ArrowLeft, Plus, Share2, ExternalLink, Trash2, ImageIcon, Loader2, Pencil } from "lucide-react";
 import { toast } from "sonner";
-import { fetchProductPreview } from "@/lib/categories";
+import { fetchProductPreview } from "@/lib/product-preview";
 
 export const Route = createFileRoute("/collection/$id")({
   head: ({ params }) => ({
@@ -71,18 +71,20 @@ function CollectionPage() {
     if (!url || !/^https?:\/\//i.test(url)) return;
     if (url === lastFetched.current) return;
     if (userEditedImage.current) return;
+    const controller = new AbortController();
     const t = setTimeout(async () => {
       lastFetched.current = url;
       setFetchingImage(true);
-      const preview = await fetchProductPreview(url);
+      const preview = await fetchProductPreview(url, { signal: controller.signal });
       setFetchingImage(false);
+      if (controller.signal.aborted) return;
       setForm((f) => ({
         ...f,
         image_url: !userEditedImage.current && preview.image ? preview.image : f.image_url,
         title: !f.title.trim() && preview.title ? preview.title : f.title,
       }));
     }, 700);
-    return () => clearTimeout(t);
+    return () => { clearTimeout(t); controller.abort(); };
   }, [form.url]);
 
 
