@@ -7,9 +7,10 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, Dialog
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ArrowLeft, Plus, Share2, ExternalLink, Trash2, ImageIcon, Loader2, Pencil } from "lucide-react";
+import { ArrowLeft, Plus, Share2, ExternalLink, Trash2, ImageIcon, Loader2, Pencil, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { fetchProductPreview } from "@/lib/product-preview";
+import { uploadProductImage } from "@/lib/upload-image";
 
 export const Route = createFileRoute("/collection/$id")({
   head: ({ params }) => ({
@@ -41,7 +42,9 @@ function CollectionPage() {
   const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
   const [fetchingImage, setFetchingImage] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const lastFetched = useRef<string>("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const load = async () => {
     const [{ data: col }, { data: lks }] = await Promise.all([
@@ -94,6 +97,22 @@ function CollectionPage() {
       toast.success("Link copiado! Compartilhe com quem quiser.");
     } catch {
       toast.error("Não foi possível copiar o link");
+    }
+  };
+
+  const onAttachImage = async (file: File | undefined) => {
+    if (!file) return;
+    setUploadingImage(true);
+    try {
+      const publicUrl = await uploadProductImage(file);
+      userEditedImage.current = true;
+      setForm((f) => ({ ...f, image_url: publicUrl }));
+      toast.success("Imagem anexada");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Falha no upload da imagem");
+    } finally {
+      setUploadingImage(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -169,7 +188,7 @@ function CollectionPage() {
                       <Input value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="https://..." type="url" />
                       {fetchingImage && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 animate-spin text-muted-foreground" />}
                     </div>
-                    <p className="text-xs text-muted-foreground">A imagem do produto é buscada automaticamente.</p>
+                    <p className="text-xs text-muted-foreground">A imagem é buscada automaticamente quando possível.</p>
                   </div>
                   <div className="space-y-2">
                     <Label>Título</Label>
@@ -179,7 +198,7 @@ function CollectionPage() {
                     <Label>Imagem do produto</Label>
                     <div className="flex gap-3 items-start">
                       <div className="w-28 h-28 rounded-md border bg-muted overflow-hidden flex items-center justify-center shrink-0">
-                        {fetchingImage ? (
+                        {fetchingImage || uploadingImage ? (
                           <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
                         ) : form.image_url ? (
                           <img
@@ -197,15 +216,36 @@ function CollectionPage() {
                         <Input
                           value={form.image_url}
                           onChange={(e) => { userEditedImage.current = true; setForm({ ...form, image_url: e.target.value }); }}
-                          placeholder="Cole ou substitua a URL da imagem"
+                          placeholder="URL da imagem (ou anexe abaixo)"
                           type="url"
                         />
-                        <div className="flex gap-2">
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp,image/gif"
+                          className="hidden"
+                          onChange={(e) => void onAttachImage(e.target.files?.[0])}
+                        />
+                        <div className="flex flex-wrap gap-2">
                           <Button
                             type="button"
                             variant="outline"
                             size="sm"
-                            disabled={!form.url.trim() || fetchingImage}
+                            disabled={uploadingImage}
+                            onClick={() => fileInputRef.current?.click()}
+                          >
+                            {uploadingImage ? (
+                              <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                            ) : (
+                              <Upload className="h-3.5 w-3.5 mr-1" />
+                            )}
+                            Anexar imagem
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={!form.url.trim() || fetchingImage || uploadingImage}
                             onClick={async () => {
                               userEditedImage.current = false;
                               lastFetched.current = "";
@@ -213,7 +253,7 @@ function CollectionPage() {
                               const preview = await fetchProductPreview(form.url.trim());
                               setFetchingImage(false);
                               if (preview.image) setForm((f) => ({ ...f, image_url: preview.image! }));
-                              else toast.error("Não foi possível buscar a imagem");
+                              else toast.error("Não foi possível buscar a imagem. Anexe uma foto.");
                             }}
                           >
                             {fetchingImage ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : null}
@@ -230,7 +270,9 @@ function CollectionPage() {
                             </Button>
                           )}
                         </div>
-                        <p className="text-xs text-muted-foreground">Se a imagem estiver errada, cole uma URL direta do produto.</p>
+                        <p className="text-xs text-muted-foreground">
+                          Se a busca automática falhar (Mercado Livre etc.), anexe a imagem do produto.
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -242,7 +284,7 @@ function CollectionPage() {
                 </div>
                 <DialogFooter>
                   <Button variant="ghost" onClick={() => setOpen(false)}>Cancelar</Button>
-                  <Button onClick={save} disabled={saving}>{editing ? "Salvar" : "Adicionar"}</Button>
+                  <Button onClick={save} disabled={saving || uploadingImage}>{editing ? "Salvar" : "Adicionar"}</Button>
                 </DialogFooter>
               </DialogContent>
             </Dialog>

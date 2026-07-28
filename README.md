@@ -39,10 +39,6 @@ App em `http://localhost:5173` (porta padrão do Vite).
 | `SUPABASE_PUBLISHABLE_KEY` | SSR/server | Mesma publishable/anon |
 | `SUPABASE_PROJECT_ID` | SSR/server | Mesmo project id |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Só servidor** | Opcional; **nunca** prefixar com `VITE_` |
-| `MERCADO_LIVRE_ACCESS_TOKEN` | **Só servidor** | Opcional; habilita a camada de API oficial do ML |
-| `SCRAPINGBEE_API_KEY` | **Só servidor** | Opcional; proxy de scraping para sites com WAF |
-| `SCRAPERAPI_API_KEY` | **Só servidor** | Opcional; alternativa ao ScrapingBee |
-| `MICROLINK_API_KEY` | **Só servidor** | Opcional; plano pago do Microlink |
 
 Regras:
 
@@ -81,27 +77,13 @@ supabase db push
 
 ## Extração da imagem do produto
 
-Ao colar o link de um produto, `GET /api/public/product-preview?url=…` devolve
-`{ image, title, source }`. A lógica fica em `src/lib/product-image.server.ts` e roda em
-cascata, parando na primeira camada que resolver:
+Ao colar o link de um produto, `GET /api/public/product-preview?url=…` tenta
+buscar a imagem automaticamente (Open Graph / Twitter / JSON-LD → Microlink).
+Sem tokens nem APIs pagas.
 
-| # | Camada | Quando entra | Observação |
-|---|---|---|---|
-| 1 | API oficial do Mercado Livre | Links do ML | Desde 2025 a API rejeita chamada anônima; sem `MERCADO_LIVRE_ACCESS_TOKEN` a camada se autodesativa |
-| 2 | Metadados estáticos | Sempre | Open Graph → Twitter Card → JSON-LD `Product`. Tenta duas vezes: User-Agent de browser e, se falhar, de crawler social |
-| 3 | Proxy de scraping | Camadas anteriores falharam | ScrapingBee → ScraperAPI (se houver chave) → Microlink |
-
-A tentativa com User-Agent de crawler é o que destrava Mercado Livre e Amazon: ambos
-respondem com muro anti-bot para browser, mas entregam Open Graph para quem monta preview
-de link (é como o WhatsApp faz). Imagens de `mlstatic.com` e `media-amazon.com` são
-reescritas para a versão em alta resolução.
-
-Cada camada tem timeout próprio e a cascata inteira tem teto de 15s. Os logs saem com o
-prefixo `[ImageExtractor]` indicando qual camada resolveu — útil quando um site novo começa
-a bloquear.
-
-Sites com WAF muito agressivo (Magazine Luiza, por exemplo) só resolvem com chave de
-ScrapingBee/ScraperAPI configurada.
+Quando o site bloqueia (Mercado Livre em produção, Magalu etc.), use o botão
+**Anexar imagem** no formulário: o arquivo sobe para o Storage público do Supabase
+(`product-images`) e a URL pública é gravada em `links.image_url`.
 
 ## Scripts
 

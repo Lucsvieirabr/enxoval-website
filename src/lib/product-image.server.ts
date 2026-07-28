@@ -1,24 +1,15 @@
 /**
- * Pipeline resiliente de extração da imagem principal de um produto.
+ * Extração da imagem principal de um produto via scraping simples.
  *
- * Camada 1 — API oficial do Mercado Livre (não sofre bloqueio de WAF).
- * Camada 2 — Parsing estático da página (Open Graph / Twitter Card / JSON-LD),
- *            com retentativa usando User-Agent de crawler de link preview.
- * Camada 3 — Proxy de scraping externo (ScrapingBee / ScraperAPI / Microlink).
+ * Camada 1 — HTML da página (Open Graph / Twitter Card / JSON-LD).
+ * Camada 2 — Microlink gratuito como fallback.
  *
- * Nenhuma camada lança: uma falha apenas avança a cascata. Além do timeout por
- * camada existe um teto global, para o endpoint nunca ficar pendurado.
+ * Sem tokens, OAuth ou proxies pagos. Sites que bloqueiam (ex.: Mercado Livre
+ * em datacenter) devem usar o upload manual de imagem no formulário.
  */
 
 export type ExtractionSource =
-  | "mercadolivre-api"
-  | "opengraph"
-  | "twitter-card"
-  | "json-ld"
-  | "html-fallback"
-  | "microlink"
-  | "scrapingbee"
-  | "scraperapi";
+  "opengraph" | "twitter-card" | "json-ld" | "html-fallback" | "microlink";
 
 export type ProductImageResult = {
   image: string | null;
@@ -26,20 +17,13 @@ export type ProductImageResult = {
   source: ExtractionSource | null;
 };
 
-/** Retorno de uma camada isolada: pode trazer só o título, ou nada. */
 type PartialResult = ProductImageResult;
 
-const MERCADO_LIVRE_TIMEOUT_MS = 5_000;
 const STATIC_TIMEOUT_MS = 5_000;
-/** A persona de crawler recebe a página de produto completa, então é mais lenta. */
 const STATIC_CRAWLER_TIMEOUT_MS = 8_000;
-/** Proxies externos renderizam JS, então precisam de mais folga que uma request direta. */
 const EXTERNAL_TIMEOUT_MS = 8_000;
 const VALIDATION_TIMEOUT_MS = 3_000;
-/** Teto da cascata inteira: somados, os timeouts por camada passariam de 30s. */
-const TOTAL_BUDGET_MS = 15_000;
-
-/** Páginas de e-commerce passam de 1 MB; ler além disso só custa latência. */
+const TOTAL_BUDGET_MS = 12_000;
 const HTML_BYTE_LIMIT = 1_500_000;
 
 const BROWSER_HEADERS: Record<string, string> = {
@@ -49,41 +33,24 @@ const BROWSER_HEADERS: Record<string, string> = {
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
   "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
   "Upgrade-Insecure-Requests": "1",
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Sec-Fetch-User": "?1",
   "Cache-Control": "no-cache",
   Pragma: "no-cache",
 };
 
-/**
- * Mercado Livre e Amazon servem a página real (com Open Graph) para crawlers de
- * link preview, mas mostram muro de login/anti-bot para um User-Agent de browser.
- * É o mesmo caminho que o WhatsApp usa para montar o preview de um link.
- */
-const CRAWLER_HEADERS: Record<string, string> = {
-  "User-Agent":
-    "Mozilla/5.0 (compatible; facebookexternalhit/1.1; +http://www.facebook.com/externalhit_uatext.php)",
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  "Accept-Language": "pt-BR,pt;q=0.9",
-};
+const CRAWLER_USER_AGENTS = [
+  "Mozilla/5.0 (compatible; facebookexternalhit/1.1; +http://www.facebook.com/externalhit_uatext.php)",
+  "WhatsApp/2.23.20.0",
+  "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+];
 
 const IMAGE_EXTENSION = /\.(jpe?g|png|webp|avif|gif|bmp|svg)(?:$|[?#])/i;
-/** CDNs de imagem frequentemente servem sem extensão; estas pistas evitam um HEAD extra. */
 const IMAGE_URL_HINT =
   /(\/images?\/|\/photos?\/|\/media\/|\/produtos?\/|[?&](?:format|fm|f|output)=(?:jpe?g|png|webp|avif))/i;
 const BLOCKED_IMAGE_HINT =
-  /(logo|avatar|brand|header|sprite|favicon|placeholder|navigation|spinner|loading|1x1|pixel\.)/i;
-
-// ---------------------------------------------------------------------------
-// Logs
-// ---------------------------------------------------------------------------
-
-type LogLevel = "info" | "warn";
+  /(logo|avatar|brand|header|sprite|favicon|placeholder|navigation|spinner|loading|1x1|pixel\.|frontend-assets\/ui-navigation|logo__small)/i;
 
 function log(
-  level: LogLevel,
+  level: "info" | "warn",
   layer: string,
   event: string,
   detail: Record<string, unknown> = {},
@@ -92,17 +59,6 @@ function log(
   const payload = { scope: "ImageExtractor", layer, event, ...detail };
   if (level === "warn") console.warn(message, payload);
   else console.info(message, payload);
-}
-
-// ---------------------------------------------------------------------------
-// Utilidades genéricas
-// ---------------------------------------------------------------------------
-
-function readEnv(name: string): string | undefined {
-  const fromProcess = typeof process !== "undefined" ? process.env?.[name] : undefined;
-  if (fromProcess) return fromProcess;
-  const fromMeta = (import.meta as { env?: Record<string, string | undefined> }).env;
-  return fromMeta?.[name] || undefined;
 }
 
 function asString(value: unknown): string | null {
@@ -137,11 +93,6 @@ function errorMessage(error: unknown): string {
 
 const HEAD_IMAGE_META = /property=["']og:image|name=["']twitter:image/i;
 
-/**
- * Lê o corpo respeitando o charset declarado e um teto de bytes, e corta a
- * leitura assim que o `<head>` fecha já contendo a meta tag de imagem — páginas
- * de produto passam de 500 KB e baixá-las inteiras estoura o timeout da camada.
- */
 async function readBodyLimited(res: Response, limit = HTML_BYTE_LIMIT): Promise<string> {
   const charset = /charset=["']?([\w-]+)/i.exec(res.headers.get("content-type") ?? "")?.[1];
   let decoder: TextDecoder;
@@ -175,10 +126,6 @@ async function readBodyLimited(res: Response, limit = HTML_BYTE_LIMIT): Promise<
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Normalização e validação de URL de imagem
-// ---------------------------------------------------------------------------
-
 function decodeHtmlEntities(value: string): string {
   return value
     .replace(/&(?:quot|#34|#x22);/gi, '"')
@@ -186,10 +133,9 @@ function decodeHtmlEntities(value: string): string {
     .replace(/&(?:lt|#60|#x3c);/gi, "<")
     .replace(/&(?:gt|#62|#x3e);/gi, ">")
     .replace(/&(?:nbsp|#160|#xa0);/gi, " ")
-    .replace(/&(?:amp|#38|#x26);/gi, "&"); // por último: senão "&amp;quot;" vira aspas
+    .replace(/&(?:amp|#38|#x26);/gi, "&");
 }
 
-/** Resolve relativas/protocol-relative contra a página e devolve sempre absoluto em https. */
 export function normalizeImageUrl(raw: unknown, baseUrl: string): string | null {
   const candidate = asString(raw);
   if (!candidate) return null;
@@ -200,7 +146,6 @@ export function normalizeImageUrl(raw: unknown, baseUrl: string): string | null 
   try {
     const resolved = new URL(withProtocol, baseUrl);
     if (resolved.protocol !== "http:" && resolved.protocol !== "https:") return null;
-    // A página é servida por https; imagem em http seria bloqueada como mixed content.
     resolved.protocol = "https:";
     return resolved.toString();
   } catch {
@@ -208,7 +153,6 @@ export function normalizeImageUrl(raw: unknown, baseUrl: string): string | null 
   }
 }
 
-/** Detecta miniaturas declaradas na própria URL (ex.: `_80x80.jpg`, `?w=50`). */
 function isTinyImage(url: string): boolean {
   const dimensions = url.match(/[_\-.](\d{2,4})x(\d{2,4})(?=\.|_|-|$|\?)/i);
   if (dimensions) {
@@ -232,7 +176,6 @@ async function respondsAsImage(url: string): Promise<boolean> {
       VALIDATION_TIMEOUT_MS,
     );
     const contentType = res.headers.get("content-type")?.toLowerCase() ?? "";
-    // Host que rejeita HEAD ou omite o content-type é inconclusivo, não reprovado.
     if (!res.ok || !contentType) return true;
     return contentType.startsWith("image/");
   } catch {
@@ -240,10 +183,6 @@ async function respondsAsImage(url: string): Promise<boolean> {
   }
 }
 
-/**
- * Reescreve URLs de CDNs conhecidos para a versão em alta resolução.
- * Medido no mlstatic: `-I` 2 KB, `-O` 26 KB, `2X_…-F` 94 KB da mesma foto.
- */
 function upgradeKnownCdn(url: string): string {
   let host: string;
   try {
@@ -258,7 +197,6 @@ function upgradeKnownCdn(url: string): string {
       .replace(/-[A-Z]\.(jpe?g|png|webp)$/i, "-F.$1");
   }
 
-  // O og:image da Amazon vem com overlays de nota/preço embutidos no nome.
   if (/(^|\.)(media-amazon|ssl-images-amazon)\.com$/i.test(host)) {
     return url.replace(/(\/images\/I\/[^./]+)\..*$/i, "$1.jpg");
   }
@@ -266,7 +204,6 @@ function upgradeKnownCdn(url: string): string {
   return url;
 }
 
-/** Normaliza, filtra heurísticas ruins e confirma que a URL realmente aponta para imagem. */
 async function validateImageCandidate(raw: unknown, baseUrl: string): Promise<string | null> {
   const normalized = normalizeImageUrl(raw, baseUrl);
   if (!normalized) return null;
@@ -285,14 +222,7 @@ async function firstValidImage(candidates: unknown[], baseUrl: string): Promise<
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Camada 1 — API oficial do Mercado Livre
-// ---------------------------------------------------------------------------
-
 const MERCADO_LIVRE_HOST = /(^|\.)(mercadolivre|mercadolibre)\.com(\.[a-z]{2,3})?$/i;
-/** Cobre todos os sites do grupo: MLB (BR), MLA (AR), MLM (MX), MCO, MPE… */
-const MERCADO_LIVRE_ITEM_ID = /\b(M[A-Z]{2})-?(\d{6,})\b/i;
-const MERCADO_LIVRE_CATALOG_ID = /\/p\/(M[A-Z]{2})-?(\d{6,})/i;
 
 export function isMercadoLivre(url: string): boolean {
   try {
@@ -302,119 +232,21 @@ export function isMercadoLivre(url: string): boolean {
   }
 }
 
-export function extractMercadoLivreId(url: string): { id: string; catalog: boolean } | null {
-  const catalog = url.match(MERCADO_LIVRE_CATALOG_ID);
-  if (catalog) return { id: `${catalog[1].toUpperCase()}${catalog[2]}`, catalog: true };
-
-  const item = url.match(MERCADO_LIVRE_ITEM_ID);
-  if (item) return { id: `${item[1].toUpperCase()}${item[2]}`, catalog: false };
-
-  return null;
-}
-
-/** Links encurtados (`/sec/...`) e de tracking só revelam o ID após o redirect. */
-async function resolveMercadoLivreRedirect(url: string): Promise<string | null> {
+/** Remove hash/query de tracking; facilita o scrape quando a página ainda responde. */
+export function canonicalizeProductUrl(url: string): string {
   try {
-    const res = await fetchWithTimeout(
-      url,
-      { method: "GET", headers: CRAWLER_HEADERS },
-      MERCADO_LIVRE_TIMEOUT_MS,
-    );
-    await res.body?.cancel().catch(() => undefined);
-    return res.url && res.url !== url ? res.url : null;
+    const parsed = new URL(url);
+    if (!isMercadoLivre(url)) return parsed.toString();
+    parsed.hash = "";
+    const keep = new Set(["wid", "item_id", "variation"]);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (!keep.has(key.toLowerCase())) parsed.searchParams.delete(key);
+    }
+    return parsed.toString();
   } catch {
-    return null;
+    return url;
   }
 }
-
-/**
- * Desde 2025 a API do Mercado Livre rejeita chamadas anônimas (403 PolicyAgent).
- * Ao confirmar isso uma vez, paramos de gastar um round-trip por link.
- */
-let mercadoLivreApiNeedsToken = false;
-
-async function fetchFromMercadoLivreApi(productUrl: string): Promise<PartialResult | null> {
-  const layer = "MercadoLivreAPI";
-  const token = readEnv("MERCADO_LIVRE_ACCESS_TOKEN");
-
-  if (!token && mercadoLivreApiNeedsToken) {
-    log("warn", layer, "camada pulada: API exige MERCADO_LIVRE_ACCESS_TOKEN", { productUrl });
-    return null;
-  }
-
-  let identifier = extractMercadoLivreId(productUrl);
-  if (!identifier) {
-    const resolved = await resolveMercadoLivreRedirect(productUrl);
-    if (resolved) identifier = extractMercadoLivreId(resolved);
-  }
-  if (!identifier) {
-    log("warn", layer, "item id não encontrado na URL", { productUrl });
-    return null;
-  }
-
-  const endpoint = identifier.catalog
-    ? `https://api.mercadolibre.com/products/${identifier.id}`
-    : `https://api.mercadolibre.com/items/${identifier.id}`;
-
-  const headers: Record<string, string> = {
-    Accept: "application/json",
-    "User-Agent": BROWSER_HEADERS["User-Agent"],
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  try {
-    const res = await fetchWithTimeout(endpoint, { headers }, MERCADO_LIVRE_TIMEOUT_MS);
-    if (!res.ok) {
-      if ((res.status === 401 || res.status === 403) && !token) {
-        mercadoLivreApiNeedsToken = true;
-        log("warn", layer, "API recusou chamada anônima; configure MERCADO_LIVRE_ACCESS_TOKEN", {
-          itemId: identifier.id,
-          status: res.status,
-        });
-      } else {
-        log("warn", layer, "resposta não-ok", { itemId: identifier.id, status: res.status });
-      }
-      return null;
-    }
-
-    const payload = asRecord(await res.json());
-    if (!payload) return null;
-
-    const pictures = Array.isArray(payload.pictures) ? payload.pictures : [];
-    const candidates = [
-      ...pictures.flatMap((picture) => {
-        const record = asRecord(picture);
-        return record ? [record.secure_url, record.url] : [];
-      }),
-      payload.secure_thumbnail,
-      payload.thumbnail,
-    ]
-      .map((value) => asString(value))
-      .filter((value): value is string => Boolean(value));
-
-    const image = await firstValidImage(candidates, productUrl);
-    const title = cleanTitle(payload.title) ?? cleanTitle(payload.name);
-
-    if (!image) {
-      log("warn", layer, "API respondeu sem imagem utilizável", { itemId: identifier.id });
-      return title ? { image: null, title, source: null } : null;
-    }
-
-    log("info", layer, "sucesso via API oficial do Mercado Livre", {
-      itemId: identifier.id,
-      catalog: identifier.catalog,
-      image,
-    });
-    return { image, title, source: "mercadolivre-api" };
-  } catch (error) {
-    log("warn", layer, "falha na chamada", { itemId: identifier.id, error: errorMessage(error) });
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Parsing de HTML (usado pela camada 2 e pelos proxies da camada 3)
-// ---------------------------------------------------------------------------
 
 const TAG_ATTRIBUTE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`=<>]+))/g;
 
@@ -426,7 +258,6 @@ function parseAttributes(tag: string): Record<string, string> {
   return attributes;
 }
 
-/** Uma chave pode repetir (galerias declaram vários `og:image`), então guardamos a lista. */
 function parseMetaTags(html: string): Map<string, string[]> {
   const meta = new Map<string, string[]>();
   for (const match of html.matchAll(/<meta\s+[^>]*>/gi)) {
@@ -500,7 +331,7 @@ function collectJsonLdImages(html: string): { productImages: string[]; anyImages
     try {
       walk(JSON.parse(raw), 0);
     } catch {
-      // JSON-LD malformado é comum; ignoramos o bloco e seguimos.
+      /* ignore */
     }
   }
 
@@ -509,11 +340,9 @@ function collectJsonLdImages(html: string): { productImages: string[]; anyImages
 
 const BLOCKED_TITLE =
   /(n[aã]o [eé] poss[ií]vel acessar|acesso negado|access denied|attention required|just a moment|are you (a )?(robot|human)|verifica[cç][aã]o|forbidden|p[aá]gina n[aã]o encontrada|page not found|error \d{3})/i;
-/** Shells de bloqueio costumam ter só o nome da loja como título. */
 const GENERIC_TITLE =
   /^(mercado ?li[bv]re|amazon(\.com(\.br)?)?|magazine luiza|magalu|americanas|shopee|casas bahia|shein|aliexpress|home|loading)$/i;
 
-/** Descarta títulos de interstitial e o preço que o Mercado Livre anexa ao og:title. */
 function cleanTitle(raw: unknown): string | null {
   const value = asString(raw);
   if (!value) return null;
@@ -530,7 +359,6 @@ function extractTitle(meta: Map<string, string[]>, html: string): string | null 
   return cleanTitle(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1]);
 }
 
-/** Núcleo compartilhado: dado um HTML, tenta OG → Twitter → JSON-LD → tags soltas. */
 async function extractFromHtml(html: string, baseUrl: string): Promise<PartialResult | null> {
   const meta = parseMetaTags(html);
   const title = extractTitle(meta, html);
@@ -569,31 +397,30 @@ async function extractFromHtml(html: string, baseUrl: string): Promise<PartialRe
   return title ? { image: null, title, source: null } : null;
 }
 
-// ---------------------------------------------------------------------------
-// Camada 2 — Requisição direta + metadados estáticos
-// ---------------------------------------------------------------------------
-
 const WAF_STATUS = new Set([401, 403, 405, 406, 409, 429, 503]);
 const CHALLENGE_MARKER =
   /(cf-browser-verification|cf_chl_|_Incapsula_|Attention Required|Access Denied|Request unsuccessful|px-captcha|Are you a robot|Enable JavaScript and cookies|suspicious-traffic|negative_traffic|n[aã]o [eé] poss[ií]vel acessar a p[aá]gina)/i;
-/** Interstitials que respondem 200 mas redirecionam para verificação/login. */
 const CHALLENGE_PATH =
   /\/(gz\/account-verification|gz\/security|lgz\/login|registration|challenge|captcha|blocked)/i;
 
-/** Uma passada da camada 2: uma persona de request + parsing do HTML devolvido. */
 async function fetchStaticOnce(
   productUrl: string,
-  persona: "browser" | "social-crawler",
+  userAgent: string,
+  timeoutMs: number,
 ): Promise<PartialResult | null> {
-  const layer = `StaticMetadata/${persona}`;
-  const isBrowser = persona === "browser";
-  const headers = isBrowser
-    ? { ...BROWSER_HEADERS, Referer: new URL(productUrl).origin + "/" }
-    : CRAWLER_HEADERS;
-  const timeout = isBrowser ? STATIC_TIMEOUT_MS : STATIC_CRAWLER_TIMEOUT_MS;
-
+  const layer = `StaticMetadata/${userAgent.slice(0, 28)}`;
   try {
-    const res = await fetchWithTimeout(productUrl, { headers }, timeout);
+    const res = await fetchWithTimeout(
+      productUrl,
+      {
+        headers: {
+          ...BROWSER_HEADERS,
+          "User-Agent": userAgent,
+          Referer: new URL(productUrl).origin + "/",
+        },
+      },
+      timeoutMs,
+    );
 
     if (!res.ok) {
       log("warn", layer, WAF_STATUS.has(res.status) ? "bloqueado pelo WAF" : "resposta não-ok", {
@@ -604,7 +431,6 @@ async function fetchStaticOnce(
     }
 
     const html = await readBodyLimited(res);
-    // Sem o descarte, o título do interstitial ("Mercado Libre") vazaria para o formulário.
     if (CHALLENGE_PATH.test(new URL(res.url || productUrl).pathname)) {
       log("warn", layer, "redirecionado para verificação anti-bot", { productUrl, to: res.url });
       return null;
@@ -614,7 +440,6 @@ async function fetchStaticOnce(
       return null;
     }
 
-    // `res.url` reflete o destino após redirects — base correta para URLs relativas.
     const result = await extractFromHtml(html, res.url || productUrl);
     if (!result?.image) {
       log("warn", layer, "nenhuma imagem encontrada nos metadados", { productUrl });
@@ -632,8 +457,16 @@ async function fetchStaticOnce(
 async function fetchFromStaticMetadata(productUrl: string): Promise<PartialResult | null> {
   let partial: PartialResult | null = null;
 
-  for (const persona of ["browser", "social-crawler"] as const) {
-    const result = await fetchStaticOnce(productUrl, persona);
+  const browser = await fetchStaticOnce(
+    productUrl,
+    BROWSER_HEADERS["User-Agent"],
+    STATIC_TIMEOUT_MS,
+  );
+  if (browser?.image) return browser;
+  partial = browser ?? partial;
+
+  for (const ua of CRAWLER_USER_AGENTS) {
+    const result = await fetchStaticOnce(productUrl, ua, STATIC_CRAWLER_TIMEOUT_MS);
     if (result?.image) return result;
     partial = partial ?? result;
   }
@@ -641,71 +474,13 @@ async function fetchFromStaticMetadata(productUrl: string): Promise<PartialResul
   return partial;
 }
 
-// ---------------------------------------------------------------------------
-// Camada 3 — Proxies de scraping externos
-// ---------------------------------------------------------------------------
-
-async function fetchViaHtmlProxy(
-  productUrl: string,
-  proxyUrl: string,
-  source: ExtractionSource,
-  layer: string,
-): Promise<PartialResult | null> {
-  try {
-    const res = await fetchWithTimeout(proxyUrl, { headers: BROWSER_HEADERS }, EXTERNAL_TIMEOUT_MS);
-    if (!res.ok) {
-      log("warn", layer, "proxy respondeu não-ok", { productUrl, status: res.status });
-      return null;
-    }
-
-    const result = await extractFromHtml(await readBodyLimited(res), productUrl);
-    if (!result?.image) {
-      log("warn", layer, "proxy retornou HTML sem imagem", { productUrl });
-      return result;
-    }
-
-    log("info", layer, `sucesso via ${source} (${result.source})`, {
-      productUrl,
-      image: result.image,
-    });
-    return { ...result, source };
-  } catch (error) {
-    log("warn", layer, "falha no proxy", { productUrl, error: errorMessage(error) });
-    return null;
-  }
-}
-
-function scrapingBeeUrl(productUrl: string, apiKey: string): string {
-  const params = new URLSearchParams({
-    api_key: apiKey,
-    url: productUrl,
-    render_js: "true",
-    block_resources: "true",
-    country_code: "br",
-  });
-  return `https://app.scrapingbee.com/api/v1/?${params.toString()}`;
-}
-
-function scraperApiUrl(productUrl: string, apiKey: string): string {
-  const params = new URLSearchParams({
-    api_key: apiKey,
-    url: productUrl,
-    country_code: "br",
-  });
-  return `https://api.scraperapi.com/?${params.toString()}`;
-}
-
 async function fetchViaMicrolink(productUrl: string): Promise<PartialResult | null> {
   const layer = "Microlink";
-  const apiKey = readEnv("MICROLINK_API_KEY");
-  const endpoint = apiKey ? "https://pro.microlink.io" : "https://api.microlink.io";
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (apiKey) headers["x-api-key"] = apiKey;
 
   const request = async (params: string): Promise<Record<string, unknown> | null> => {
     const res = await fetchWithTimeout(
-      `${endpoint}/?url=${encodeURIComponent(productUrl)}&${params}`,
-      { headers },
+      `https://api.microlink.io/?url=${encodeURIComponent(productUrl)}&${params}`,
+      { headers: { Accept: "application/json" } },
       EXTERNAL_TIMEOUT_MS,
     );
     if (!res.ok) {
@@ -732,7 +507,6 @@ async function fetchViaMicrolink(productUrl: string): Promise<PartialResult | nu
       }
     }
 
-    // Metadados vazios costumam significar OG ausente: cai para o HTML renderizado.
     const rendered = await request("meta=false&html=true&prerender=true");
     const html = rendered ? asString(rendered.html) : null;
     if (html) {
@@ -746,7 +520,6 @@ async function fetchViaMicrolink(productUrl: string): Promise<PartialResult | nu
       }
     }
 
-    // Sem imagem o título não é confiável: o Microlink o deriva do slug da URL.
     log("warn", layer, "nenhuma imagem encontrada", { productUrl });
     return null;
   } catch (error) {
@@ -754,36 +527,6 @@ async function fetchViaMicrolink(productUrl: string): Promise<PartialResult | nu
     return null;
   }
 }
-
-async function fetchFromExternalScraper(productUrl: string): Promise<PartialResult | null> {
-  const scrapingBeeKey = readEnv("SCRAPINGBEE_API_KEY");
-  if (scrapingBeeKey) {
-    const result = await fetchViaHtmlProxy(
-      productUrl,
-      scrapingBeeUrl(productUrl, scrapingBeeKey),
-      "scrapingbee",
-      "ScrapingBee",
-    );
-    if (result?.image) return result;
-  }
-
-  const scraperApiKey = readEnv("SCRAPERAPI_API_KEY");
-  if (scraperApiKey) {
-    const result = await fetchViaHtmlProxy(
-      productUrl,
-      scraperApiUrl(productUrl, scraperApiKey),
-      "scraperapi",
-      "ScraperAPI",
-    );
-    if (result?.image) return result;
-  }
-
-  return fetchViaMicrolink(productUrl);
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline público
-// ---------------------------------------------------------------------------
 
 /**
  * Executa a cascata até obter uma imagem válida.
@@ -798,31 +541,33 @@ export async function extractProductImage(productUrl: string): Promise<ProductIm
     return empty;
   }
 
+  const normalized = canonicalizeProductUrl(trimmed);
   const started = Date.now();
-  // Um título achado numa camada continua útil mesmo se a imagem vier de outra.
   const partial: { title: string | null } = { title: null };
 
   const runCascade = async (): Promise<ProductImageResult> => {
-    const layers: Array<() => Promise<PartialResult | null>> = [];
-    if (isMercadoLivre(trimmed)) layers.push(() => fetchFromMercadoLivreApi(trimmed));
-    layers.push(() => fetchFromStaticMetadata(trimmed));
-    layers.push(() => fetchFromExternalScraper(trimmed));
-
-    for (const layer of layers) {
+    for (const layer of [
+      () => fetchFromStaticMetadata(normalized),
+      () => fetchViaMicrolink(normalized),
+    ]) {
       const result = await layer();
       if (result?.title && !partial.title) partial.title = result.title;
       if (result?.image) {
         log("info", "Pipeline", "imagem resolvida", {
-          productUrl: trimmed,
+          productUrl: normalized,
           source: result.source,
           elapsedMs: Date.now() - started,
         });
-        return { image: result.image, title: result.title ?? partial.title, source: result.source };
+        return {
+          image: result.image,
+          title: result.title ?? partial.title,
+          source: result.source,
+        };
       }
     }
 
     log("warn", "Pipeline", "todas as camadas falharam", {
-      productUrl: trimmed,
+      productUrl: normalized,
       elapsedMs: Date.now() - started,
     });
     return { image: null, title: partial.title, source: null };
@@ -832,7 +577,7 @@ export async function extractProductImage(productUrl: string): Promise<ProductIm
   const budget = new Promise<ProductImageResult>((resolve) => {
     timer = setTimeout(() => {
       log("warn", "Pipeline", "orçamento de tempo esgotado", {
-        productUrl: trimmed,
+        productUrl: normalized,
         budgetMs: TOTAL_BUDGET_MS,
       });
       resolve({ image: null, title: partial.title, source: null });
